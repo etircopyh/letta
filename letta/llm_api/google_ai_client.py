@@ -20,7 +20,10 @@ class GoogleAIClient(GoogleVertexClient):
         timeout_ms = int(settings.llm_request_timeout_seconds * 1000)
         return genai.Client(
             api_key=model_settings.gemini_api_key,
-            http_options=HttpOptions(timeout=timeout_ms),
+            http_options=HttpOptions(
+                timeout=timeout_ms,
+                base_url=model_settings.gemini_base_url,
+            ),
         )
 
 
