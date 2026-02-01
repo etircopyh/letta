@@ -189,6 +189,7 @@ all_configs = [
     "openai-gpt-5.json",  # TODO: GPT-5 disabled for now, it sends HiddenReasoningMessages which break the tests.
     "claude-4-5-sonnet.json",
     "gemini-2.5-pro.json",
+    "minimax-m2.1-lightning.json",
 ]
 
 reasoning_configs = [
@@ -229,7 +230,8 @@ def is_reasoner_model(model_handle: str, model_settings: dict) -> bool:
         return model.startswith("o1") or model.startswith("o3") or model.startswith("o4") or model.startswith("gpt-5")
 
     # Anthropic reasoning models (from anthropic_client.py:608-616)
-    elif provider_type == "anthropic":
+    # Also applies to Bedrock with Anthropic models
+    elif provider_type in ("anthropic", "bedrock"):
         return (
             model.startswith("claude-3-7-sonnet")
             or model.startswith("claude-sonnet-4")
@@ -241,6 +243,10 @@ def is_reasoner_model(model_handle: str, model_settings: dict) -> bool:
     # Google Vertex/AI reasoning models (from google_vertex_client.py:691-696)
     elif provider_type in ["google_vertex", "google_ai"]:
         return model.startswith("gemini-2.5-flash") or model.startswith("gemini-2.5-pro") or model.startswith("gemini-3")
+
+    # MiniMax reasoning models (all M2.x models support native interleaved thinking)
+    elif provider_type == "minimax":
+        return model.startswith("MiniMax-M2")
 
     return False
 
@@ -1017,7 +1023,7 @@ def server_url() -> str:
         thread.start()
 
         # Poll until the server is up (or timeout)
-        timeout_seconds = 30
+        timeout_seconds = 60
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
@@ -1057,7 +1063,6 @@ def agent_state(client: Letta) -> AgentState:
     Creates and returns an agent state for testing with a pre-configured agent.
     The agent is named 'supervisor' and is configured with base tools and the roll_dice tool.
     """
-    client.tools.upsert_base_tools()
     dice_tool = client.tools.upsert_from_function(func=roll_dice)
 
     send_message_tool = client.tools.list(name="send_message").items[0]

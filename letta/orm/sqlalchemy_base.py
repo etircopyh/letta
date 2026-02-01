@@ -5,6 +5,7 @@ from functools import wraps
 from pprint import pformat
 from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Union
 
+from asyncpg.exceptions import QueryCanceledError
 from sqlalchemy import Sequence, String, and_, delete, func, or_, select
 from sqlalchemy.exc import DBAPIError, IntegrityError, TimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.orm.interfaces import ORMOption
 
+from letta.errors import ConcurrentUpdateError
 from letta.log import get_logger
 from letta.orm.base import Base, CommonSqlalchemyMetaMixins
 from letta.orm.errors import DatabaseTimeoutError, ForeignKeyConstraintViolationError, NoResultFound, UniqueConstraintViolationError
@@ -25,7 +27,11 @@ logger = get_logger(__name__)
 
 
 def handle_db_timeout(func):
-    """Decorator to handle SQLAlchemy TimeoutError and wrap it in a custom exception."""
+    """Decorator to handle database timeout errors and wrap them in a custom exception.
+
+    Catches both SQLAlchemy TimeoutError (pool/connection timeout) and asyncpg's
+    QueryCanceledError (PostgreSQL statement_timeout triggered).
+    """
     if not inspect.iscoroutinefunction(func):
 
         @wraps(func)
@@ -35,6 +41,11 @@ def handle_db_timeout(func):
             except TimeoutError as e:
                 logger.error(f"Timeout while executing {func.__name__} with args {args} and kwargs {kwargs}: {e}")
                 raise DatabaseTimeoutError(message=f"Timeout occurred in {func.__name__}.", original_exception=e)
+            except QueryCanceledError as e:
+                logger.error(
+                    f"Query canceled (statement timeout) while executing {func.__name__} with args {args} and kwargs {kwargs}: {e}"
+                )
+                raise DatabaseTimeoutError(message=f"Query canceled due to statement timeout in {func.__name__}.", original_exception=e)
 
         return wrapper
     else:
@@ -46,6 +57,11 @@ def handle_db_timeout(func):
             except TimeoutError as e:
                 logger.error(f"Timeout while executing {func.__name__} with args {args} and kwargs {kwargs}: {e}")
                 raise DatabaseTimeoutError(message=f"Timeout occurred in {func.__name__}.", original_exception=e)
+            except QueryCanceledError as e:
+                logger.error(
+                    f"Query canceled (statement timeout) while executing {func.__name__} with args {args} and kwargs {kwargs}: {e}"
+                )
+                raise DatabaseTimeoutError(message=f"Query canceled due to statement timeout in {func.__name__}.", original_exception=e)
 
         return async_wrapper
 
@@ -195,6 +211,10 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         """
         Constructs the query for listing records.
         """
+        # Security check: if the model has organization_id column, actor should be provided
+        if actor is None and hasattr(cls, "organization_id"):
+            logger.warning(f"SECURITY: Listing org-scoped model {cls.__name__} without actor. This bypasses organization filtering.")
+
         query = select(cls)
 
         if join_model and join_conditions:
@@ -259,28 +279,40 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
 
             if before_obj and after_obj:
                 # Window-based query - get records between before and after
-                conditions.append(
-                    or_(cls.created_at < before_obj.created_at, and_(cls.created_at == before_obj.created_at, cls.id < before_obj.id))
-                )
-                conditions.append(
-                    or_(cls.created_at > after_obj.created_at, and_(cls.created_at == after_obj.created_at, cls.id > after_obj.id))
-                )
+                # Skip pagination if either object has null created_at
+                if before_obj.created_at is not None and after_obj.created_at is not None:
+                    conditions.append(
+                        or_(cls.created_at < before_obj.created_at, and_(cls.created_at == before_obj.created_at, cls.id < before_obj.id))
+                    )
+                    conditions.append(
+                        or_(cls.created_at > after_obj.created_at, and_(cls.created_at == after_obj.created_at, cls.id > after_obj.id))
+                    )
+                else:
+                    logger.warning(
+                        f"Skipping pagination: before_obj.created_at={before_obj.created_at}, after_obj.created_at={after_obj.created_at}"
+                    )
             else:
                 # Pure pagination query
                 if before_obj:
-                    conditions.append(
-                        or_(
-                            cls.created_at < before_obj.created_at if ascending else cls.created_at > before_obj.created_at,
-                            and_(cls.created_at == before_obj.created_at, cls.id < before_obj.id),
+                    if before_obj.created_at is not None:
+                        conditions.append(
+                            or_(
+                                cls.created_at < before_obj.created_at if ascending else cls.created_at > before_obj.created_at,
+                                and_(cls.created_at == before_obj.created_at, cls.id < before_obj.id),
+                            )
                         )
-                    )
+                    else:
+                        logger.warning(f"Skipping 'before' pagination: before_obj.created_at is None (id={before_obj.id})")
                 if after_obj:
-                    conditions.append(
-                        or_(
-                            cls.created_at > after_obj.created_at if ascending else cls.created_at < after_obj.created_at,
-                            and_(cls.created_at == after_obj.created_at, cls.id > after_obj.id),
+                    if after_obj.created_at is not None:
+                        conditions.append(
+                            or_(
+                                cls.created_at > after_obj.created_at if ascending else cls.created_at < after_obj.created_at,
+                                and_(cls.created_at == after_obj.created_at, cls.id > after_obj.id),
+                            )
                         )
-                    )
+                    else:
+                        logger.warning(f"Skipping 'after' pagination: after_obj.created_at is None (id={after_obj.id})")
 
             if conditions:
                 query = query.where(and_(*conditions))
@@ -421,6 +453,14 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         **kwargs,
     ):
         logger.debug(f"Reading {cls.__name__} with ID(s): {identifiers} with actor={actor}")
+
+        # Security check: if the model has organization_id column, actor should be provided
+        # to ensure proper org-scoping. Log a warning if actor is None.
+        if actor is None and hasattr(cls, "organization_id"):
+            logger.warning(
+                f"SECURITY: Reading org-scoped model {cls.__name__} without actor. "
+                f"IDs: {identifiers}. This bypasses organization filtering."
+            )
 
         # Start the query
         query = select(cls)
@@ -619,6 +659,11 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         if actor:
             self._set_created_and_updated_by_fields(actor.id)
         self.set_updated_at()
+
+        # Capture id before try block to avoid accessing expired attributes after rollback
+        object_id = self.id
+        class_name = self.__class__.__name__
+
         try:
             db_session.add(self)
             if no_commit:
@@ -633,8 +678,10 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
             # This can occur when using optimistic locking (version_id_col) and:
             # 1. The row doesn't exist (0 rows matched)
             # 2. The version has changed (concurrent update)
-            # We convert this to NoResultFound to return a proper 404 error
-            raise NoResultFound(f"{self.__class__.__name__} with id '{self.id}' not found or was updated by another transaction") from e
+            # In practice, case 1 is rare (blocks aren't frequently deleted), so we always
+            # return 409 ConcurrentUpdateError. If it was actually deleted, the retry will get 404.
+            # Not worth performing another db query to check if the row exists.
+            raise ConcurrentUpdateError(resource_type=class_name, resource_id=object_id) from e
         except (DBAPIError, IntegrityError) as e:
             self._handle_dbapi_error(e)
 
@@ -650,6 +697,12 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         **kwargs,
     ):
         logger.debug(f"Calculating size for {cls.__name__} with filters {kwargs}")
+
+        # Security check: if the model has organization_id column, actor should be provided
+        if actor is None and hasattr(cls, "organization_id"):
+            logger.warning(
+                f"SECURITY: Calculating size for org-scoped model {cls.__name__} without actor. This bypasses organization filtering."
+            )
         query = select(func.count(1)).select_from(cls)
 
         if actor:
@@ -750,6 +803,12 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         error_code = None
         error_message = str(orig) if orig else str(e)
         logger.info(f"Handling DBAPIError: {error_message}")
+
+        # Handle asyncpg QueryCanceledError (wrapped in DBAPIError)
+        # This occurs when PostgreSQL's statement_timeout kills a long-running query
+        if isinstance(orig, QueryCanceledError):
+            logger.error(f"Query canceled (statement timeout) for {cls.__name__}: {e}")
+            raise DatabaseTimeoutError(message=f"Query canceled due to statement timeout for {cls.__name__}.", original_exception=e) from e
 
         # Handle SQLite-specific errors
         if "UNIQUE constraint failed" in error_message:

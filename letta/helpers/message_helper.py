@@ -12,23 +12,52 @@ from letta.schemas.letta_message_content import Base64Image, ImageContent, Image
 from letta.schemas.message import Message, MessageCreate
 
 
-async def _fetch_image_from_url(url: str) -> tuple[bytes, str | None]:
+async def _fetch_image_from_url(url: str, max_retries: int = 1, timeout_seconds: float = 5.0) -> tuple[bytes, str | None]:
     """
     Async helper to fetch image from URL without blocking the event loop.
+    Retries once on timeout to handle transient network issues.
+
+    Args:
+        url: URL of the image to fetch
+        max_retries: Number of retry attempts (default: 1)
+        timeout_seconds: Total timeout in seconds (default: 5.0)
+
+    Returns:
+        Tuple of (image_bytes, media_type)
+
+    Raises:
+        LettaImageFetchError: If image fetch fails after all retries
     """
-    timeout = httpx.Timeout(15.0, connect=5.0)
+    # Connect timeout is half of total timeout, capped at 3 seconds
+    connect_timeout = min(timeout_seconds / 2, 3.0)
+    timeout = httpx.Timeout(timeout_seconds, connect=connect_timeout)
     headers = {"User-Agent": f"Letta/{__version__}"}
-    try:
-        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            image_response = await client.get(url, follow_redirects=True)
-            image_response.raise_for_status()
-            image_bytes = image_response.content
-            image_media_type = image_response.headers.get("content-type")
-            return image_bytes, image_media_type
-    except (httpx.RemoteProtocolError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
-        raise LettaImageFetchError(url=url, reason=str(e))
-    except Exception as e:
-        raise LettaImageFetchError(url=url, reason=f"Unexpected error: {e}")
+
+    last_exception = None
+    for attempt in range(max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+                image_response = await client.get(url, follow_redirects=True)
+                image_response.raise_for_status()
+                image_bytes = image_response.content
+                image_media_type = image_response.headers.get("content-type")
+                return image_bytes, image_media_type
+        except httpx.TimeoutException as e:
+            last_exception = e
+            if attempt < max_retries:
+                # Brief delay before retry
+                await asyncio.sleep(0.5)
+                continue
+            # Final attempt failed
+            raise LettaImageFetchError(url=url, reason=f"Timeout after {max_retries + 1} attempts: {e}")
+        except (httpx.RemoteProtocolError, httpx.HTTPStatusError) as e:
+            # Don't retry on protocol errors or HTTP errors (4xx, 5xx)
+            raise LettaImageFetchError(url=url, reason=str(e))
+        except Exception as e:
+            raise LettaImageFetchError(url=url, reason=f"Unexpected error: {e}")
+
+    # Should never reach here, but just in case
+    raise LettaImageFetchError(url=url, reason=f"Failed after {max_retries + 1} attempts: {last_exception}")
 
 
 async def convert_message_creates_to_messages(
@@ -137,3 +166,61 @@ async def _convert_message_create_to_message(
         batch_item_id=message_create.batch_item_id,
         run_id=run_id,
     )
+
+
+async def _resolve_url_to_base64(url: str) -> tuple[str, str]:
+    """Resolve URL to base64 data and media type."""
+    if url.startswith("file://"):
+        parsed = urlparse(url)
+        file_path = unquote(parsed.path)
+        image_bytes = await asyncio.to_thread(lambda: open(file_path, "rb").read())
+        media_type, _ = mimetypes.guess_type(file_path)
+        media_type = media_type or "image/jpeg"
+    else:
+        image_bytes, media_type = await _fetch_image_from_url(url)
+        media_type = media_type or mimetypes.guess_type(url)[0] or "image/png"
+
+    image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
+    return image_data, media_type
+
+
+async def resolve_tool_return_images(func_response: str | list) -> str | list:
+    """Resolve URL and LettaImage sources to base64 for tool returns."""
+    if isinstance(func_response, str):
+        return func_response
+
+    resolved = []
+    for part in func_response:
+        if isinstance(part, ImageContent):
+            if part.source.type == ImageSourceType.url:
+                image_data, media_type = await _resolve_url_to_base64(part.source.url)
+                part.source = Base64Image(media_type=media_type, data=image_data)
+            elif part.source.type == ImageSourceType.letta and not part.source.data:
+                pass
+            resolved.append(part)
+        elif isinstance(part, TextContent):
+            resolved.append(part)
+        elif isinstance(part, dict):
+            if part.get("type") == "image" and part.get("source", {}).get("type") == "url":
+                url = part["source"].get("url")
+                if url:
+                    image_data, media_type = await _resolve_url_to_base64(url)
+                    resolved.append(
+                        ImageContent(
+                            source=Base64Image(
+                                media_type=media_type,
+                                data=image_data,
+                                detail=part.get("source", {}).get("detail"),
+                            )
+                        )
+                    )
+                else:
+                    resolved.append(part)
+            elif part.get("type") == "text":
+                resolved.append(TextContent(text=part.get("text", "")))
+            else:
+                resolved.append(part)
+        else:
+            resolved.append(part)
+
+    return resolved

@@ -1,5 +1,5 @@
 import uuid
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
@@ -7,6 +7,20 @@ from letta.constants import DEFAULT_MAX_STEPS, DEFAULT_MESSAGE_TOOL, DEFAULT_MES
 from letta.schemas.letta_message import MessageType
 from letta.schemas.letta_message_content import LettaMessageContentUnion
 from letta.schemas.message import MessageCreate, MessageCreateUnion, MessageRole
+from letta.validators import AgentId
+
+
+class ClientToolSchema(BaseModel):
+    """Schema for a client-side tool passed in the request.
+
+    Client-side tools are executed by the client, not the server. When the agent
+    calls a client-side tool, execution pauses and returns control to the client
+    to execute the tool and provide the result.
+    """
+
+    name: str = Field(..., description="The name of the tool function")
+    description: Optional[str] = Field(None, description="Description of what the tool does")
+    parameters: Optional[Dict[str, Any]] = Field(None, description="JSON Schema for the function parameters")
 
 
 class LettaRequest(BaseModel):
@@ -43,6 +57,20 @@ class LettaRequest(BaseModel):
         default=True,
         description="If set to True, enables reasoning before responses or tool calls from the agent.",
         deprecated=True,
+    )
+
+    # Client-side tools
+    client_tools: Optional[List[ClientToolSchema]] = Field(
+        None,
+        description="Client-side tools that the agent can call. When the agent calls a client-side tool, "
+        "execution pauses and returns control to the client to execute the tool and provide the result via a ToolReturn.",
+    )
+
+    # Model override
+    override_model: Optional[str] = Field(
+        None,
+        description="Model handle to use for this request instead of the agent's default model. "
+        "This allows sending a message to a different model without changing the agent's configuration.",
     )
 
     @field_validator("messages", mode="before")
@@ -98,12 +126,33 @@ class LettaStreamingRequest(LettaRequest):
     )
 
 
+class ConversationMessageRequest(LettaRequest):
+    """Request for sending messages to a conversation. Streams by default."""
+
+    streaming: bool = Field(
+        default=True,
+        description="If True (default), returns a streaming response (Server-Sent Events). If False, returns a complete JSON response.",
+    )
+    stream_tokens: bool = Field(
+        default=False,
+        description="Flag to determine if individual tokens should be streamed, rather than streaming per step (only used when streaming=true).",
+    )
+    include_pings: bool = Field(
+        default=True,
+        description="Whether to include periodic keepalive ping messages in the stream to prevent connection timeouts (only used when streaming=true).",
+    )
+    background: bool = Field(
+        default=False,
+        description="Whether to process the request in the background (only used when streaming=true).",
+    )
+
+
 class LettaAsyncRequest(LettaRequest):
     callback_url: Optional[str] = Field(None, description="Optional callback URL to POST to when the job completes")
 
 
 class LettaBatchRequest(LettaRequest):
-    agent_id: str = Field(..., description="The ID of the agent to send this batch request for")
+    agent_id: AgentId = Field(..., description="The ID of the agent to send this batch request for")
 
 
 class CreateBatch(BaseModel):

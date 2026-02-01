@@ -44,6 +44,31 @@ def _create_path_validator_factory(primitive: str):
 PATH_VALIDATORS = {primitive_type.value: _create_path_validator_factory(primitive_type.value) for primitive_type in PrimitiveType}
 
 
+def _create_conversation_id_or_default_path_validator_factory():
+    """Conversation IDs accept the usual primitive format or the special value 'default'."""
+
+    primitive = PrimitiveType.CONVERSATION.value
+    prefix_pattern = PRIMITIVE_ID_PATTERNS[primitive].pattern
+    # Make the full regex accept either the primitive ID format or 'default'.
+    # `prefix_pattern` already contains the ^...$ anchors.
+    conversation_or_default_pattern = f"^(default|{prefix_pattern[1:-1]})$"
+
+    def factory():
+        return Path(
+            description=(f"The conversation identifier. Either the special value 'default' or an ID in the format '{primitive}-<uuid4>'"),
+            pattern=conversation_or_default_pattern,
+            examples=["default", f"{primitive}-123e4567-e89b-42d3-8456-426614174000"],
+            min_length=1,
+            max_length=len(primitive) + 1 + 36,
+        )
+
+    return factory
+
+
+# Override conversation ID path validation to also allow the special value 'default'.
+PATH_VALIDATORS[PrimitiveType.CONVERSATION.value] = _create_conversation_id_or_default_path_validator_factory()
+
+
 # Type aliases for common ID types
 # These can be used directly in route handler signatures for cleaner code
 AgentId = Annotated[str, PATH_VALIDATORS[PrimitiveType.AGENT.value]()]
@@ -62,6 +87,7 @@ ProviderId = Annotated[str, PATH_VALIDATORS[PrimitiveType.PROVIDER.value]()]
 SandboxConfigId = Annotated[str, PATH_VALIDATORS[PrimitiveType.SANDBOX_CONFIG.value]()]
 StepId = Annotated[str, PATH_VALIDATORS[PrimitiveType.STEP.value]()]
 IdentityId = Annotated[str, PATH_VALIDATORS[PrimitiveType.IDENTITY.value]()]
+ConversationId = Annotated[str, PATH_VALIDATORS[PrimitiveType.CONVERSATION.value]()]
 
 # Infrastructure types
 McpServerId = Annotated[str, PATH_VALIDATORS[PrimitiveType.MCP_SERVER.value]()]
@@ -138,7 +164,6 @@ def _create_id_query_validator(primitive: str):
 
     Args:
         primitive: The primitive type prefix (e.g., "agent", "tool")
-
     Returns:
         A Query validator with pattern matching
     """
@@ -161,6 +186,8 @@ RunIdQuery = Annotated[Optional[str], _create_id_query_validator(PrimitiveType.R
 JobIdQuery = Annotated[Optional[str], _create_id_query_validator(PrimitiveType.JOB.value)]
 GroupIdQuery = Annotated[Optional[str], _create_id_query_validator(PrimitiveType.GROUP.value)]
 IdentityIdQuery = Annotated[Optional[str], _create_id_query_validator(PrimitiveType.IDENTITY.value)]
+UserIdQuery = Annotated[Optional[str], _create_id_query_validator(PrimitiveType.USER.value)]
+UserIdQueryRequired = Annotated[str, _create_id_query_validator(PrimitiveType.USER.value)]
 
 
 # =============================================================================
@@ -172,11 +199,11 @@ IdentityIdQuery = Annotated[Optional[str], _create_id_query_validator(PrimitiveT
 BlockLabelQuery = Annotated[
     Optional[str],
     Query(
-        description="Label to include (alphanumeric, hyphens, underscores only)",
-        pattern=r"^[a-zA-Z0-9_-]+$",
+        description="Label to include (alphanumeric, hyphens, underscores, forward slashes)",
+        pattern=r"^[a-zA-Z0-9_/-]+$",
         min_length=1,
         max_length=50,
-        examples=["human", "persona", "the_label_of-a-block"],
+        examples=["human", "persona", "the_label_of-a-block", "the_label_of-a-block/with-forward-slash"],
     ),
 ]
 
@@ -198,10 +225,10 @@ BlockLabelSearchQuery = Annotated[
     Optional[str],
     Query(
         description="Search blocks by label. If provided, returns blocks whose label matches the search query. This is a full-text search on block labels.",
-        pattern=r"^[a-zA-Z0-9_-]+$",
+        pattern=r"^[a-zA-Z0-9_/-]+$",
         min_length=1,
         max_length=50,
-        examples=["human", "persona", "the_label_of-a-block"],
+        examples=["human", "persona", "the_label_of-a-block", "the_label_of-a-block/with-forward-slash"],
     ),
 ]
 

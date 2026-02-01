@@ -689,7 +689,6 @@ async def connect_mcp_server(
             yield oauth_stream_event(OauthStreamEvent.CONNECTION_ATTEMPT, server_name=request.server_name)
 
             actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-
             # Create MCP client with respective transport type
             try:
                 request.resolve_environment_variables()
@@ -704,8 +703,18 @@ async def connect_mcp_server(
                 tools = await client.list_tools(serialize=True)
                 yield oauth_stream_event(OauthStreamEvent.SUCCESS, tools=tools)
                 return
-            except ConnectionError:
-                # TODO: jnjpng make this connection error check more specific to the 401 unauthorized error
+            except ConnectionError as e:
+                # Only trigger OAuth flow on explicit unauthorized failures
+                unauthorized = False
+                if isinstance(e.__cause__, HTTPStatusError):
+                    unauthorized = e.__cause__.response.status_code == 401
+                elif "401" in str(e) or "Unauthorized" in str(e):
+                    unauthorized = True
+
+                if not unauthorized:
+                    yield oauth_stream_event(OauthStreamEvent.ERROR, message=f"Connection failed: {str(e)}")
+                    return
+
                 if isinstance(client, AsyncStdioMCPClient):
                     logger.warning("OAuth not supported for stdio")
                     yield oauth_stream_event(OauthStreamEvent.ERROR, message="OAuth not supported for stdio")
@@ -824,36 +833,47 @@ async def execute_mcp_tool(
                 logger.warning(f"Error during MCP client cleanup: {cleanup_error}")
 
 
-# TODO: @jnjpng need to route this through cloud API for production
-@router.get("/mcp/oauth/callback/{session_id}", operation_id="mcp_oauth_callback")
+# Static OAuth callback endpoint - session is identified via state parameter
+@router.get("/mcp/oauth/callback", operation_id="mcp_oauth_callback")
 async def mcp_oauth_callback(
-    session_id: str,
     code: Optional[str] = Query(None, description="OAuth authorization code"),
     state: Optional[str] = Query(None, description="OAuth state parameter"),
     error: Optional[str] = Query(None, description="OAuth error"),
     error_description: Optional[str] = Query(None, description="OAuth error description"),
+    server: SyncServer = Depends(get_letta_server),
 ):
     """
     Handle OAuth callback for MCP server authentication.
+    Session is identified via the state parameter instead of URL path.
     """
     try:
-        oauth_session = MCPOAuthSession(session_id)
+        if not state:
+            return {"status": "error", "message": "Missing state parameter"}
+
+        # Look up OAuth session by state parameter
+        oauth_session = await server.mcp_server_manager.get_oauth_session_by_state(state)
+        if not oauth_session:
+            return {"status": "error", "message": "Invalid or expired state parameter"}
+
         if error:
             error_msg = f"OAuth error: {error}"
             if error_description:
                 error_msg += f" - {error_description}"
-            await oauth_session.update_session_status(OAuthSessionStatus.ERROR)
+            # Note: Using MCPOAuthSession directly because this callback is unauthenticated
+            # (called by OAuth provider) and the manager's update_oauth_session requires an actor
+            await MCPOAuthSession(oauth_session.id).update_session_status(OAuthSessionStatus.ERROR)
             return {"status": "error", "message": error_msg}
 
-        if not code or not state:
-            await oauth_session.update_session_status(OAuthSessionStatus.ERROR)
-            return {"status": "error", "message": "Missing authorization code or state"}
+        if not code:
+            await MCPOAuthSession(oauth_session.id).update_session_status(OAuthSessionStatus.ERROR)
+            return {"status": "error", "message": "Missing authorization code"}
 
-        # Store authorization code
-        success = await oauth_session.store_authorization_code(code, state)
+        # Store authorization code (using MCPOAuthSession since callback is unauthenticated)
+        session_handler = MCPOAuthSession(oauth_session.id)
+        success = await session_handler.store_authorization_code(code, state)
         if not success:
-            await oauth_session.update_session_status(OAuthSessionStatus.ERROR)
-            return {"status": "error", "message": "Invalid state parameter"}
+            await session_handler.update_session_status(OAuthSessionStatus.ERROR)
+            return {"status": "error", "message": "Failed to store authorization code"}
 
         return {"status": "success", "message": "Authorization successful", "server_url": success.server_url}
 
@@ -932,7 +952,13 @@ async def generate_tool_from_prompt(
         llm_config,
         tools=[tool],
     )
-    response_data = await llm_client.request_async(request_data, llm_config)
+    from letta.services.telemetry_manager import TelemetryManager
+
+    llm_client.set_telemetry_context(
+        telemetry_manager=TelemetryManager(),
+        call_type="tool_generation",
+    )
+    response_data = await llm_client.request_async_with_telemetry(request_data, llm_config)
     response = await llm_client.convert_response_to_chat_completion(response_data, input_messages, llm_config)
 
     # Validate that we got a tool call response

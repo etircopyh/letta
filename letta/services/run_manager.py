@@ -5,6 +5,7 @@ from typing import List, Literal, Optional
 
 from httpx import AsyncClient
 
+from letta.data_sources.redis_client import get_redis_client
 from letta.errors import LettaInvalidArgumentError
 from letta.helpers.datetime_helpers import get_utc_time
 from letta.log import get_logger
@@ -88,7 +89,8 @@ class RunManager:
                 num_steps=0,  # Initialize to 0
             )
             await metrics.create_async(session)
-            await session.commit()
+            # context manager now handles commits
+            # await session.commit()
 
         return run.to_pydantic()
 
@@ -136,6 +138,7 @@ class RunManager:
     async def list_runs(
         self,
         actor: PydanticUser,
+        run_id: Optional[str] = None,
         agent_id: Optional[str] = None,
         agent_ids: Optional[List[str]] = None,
         statuses: Optional[List[RunStatus]] = None,
@@ -150,6 +153,7 @@ class RunManager:
         step_count_operator: ComparisonOperator = ComparisonOperator.EQ,
         tools_used: Optional[List[str]] = None,
         project_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
         order_by: Literal["created_at", "duration"] = "created_at",
         duration_percentile: Optional[int] = None,
         duration_filter: Optional[dict] = None,
@@ -171,6 +175,9 @@ class RunManager:
             if project_id:
                 query = query.filter(RunModel.project_id == project_id)
 
+            if run_id:
+                query = query.filter(RunModel.id == run_id)
+
             # Handle agent filtering
             if agent_id:
                 agent_ids = [agent_id]
@@ -188,6 +195,10 @@ class RunManager:
             # Filter by background
             if background is not None:
                 query = query.filter(RunModel.background == background)
+
+            # Filter by conversation_id
+            if conversation_id is not None:
+                query = query.filter(RunModel.conversation_id == conversation_id)
 
             # Filter by template_family (base_template_id)
             if template_family:
@@ -312,7 +323,12 @@ class RunManager:
     @raise_on_invalid_id(param_name="run_id", expected_prefix=PrimitiveType.RUN)
     @trace_method
     async def update_run_by_id_async(
-        self, run_id: str, update: RunUpdate, actor: PydanticUser, refresh_result_messages: bool = True
+        self,
+        run_id: str,
+        update: RunUpdate,
+        actor: PydanticUser,
+        refresh_result_messages: bool = True,
+        conversation_id: Optional[str] = None,
     ) -> PydanticRun:
         """Update a run using a RunUpdate object."""
         async with db_registry.async_session() as session:
@@ -352,8 +368,15 @@ class RunManager:
                     logger.warning(f"Run {run_id} completed without a completed_at timestamp")
                     update.completed_at = get_utc_time().replace(tzinfo=None)
 
-            # Update job attributes with only the fields that were explicitly set
+            # Update run attributes with only the fields that were explicitly set
             update_data = update.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
+
+            # Merge metadata updates instead of overwriting.
+            # This is important for streaming/background flows where different components update
+            # different parts of metadata (e.g., run_type set at creation, error payload set at terminal).
+            if "metadata_" in update_data and isinstance(update_data["metadata_"], dict):
+                existing_metadata = run.metadata_ if isinstance(run.metadata_, dict) else {}
+                update_data["metadata_"] = {**existing_metadata, **update_data["metadata_"]}
 
             # Automatically update the completion timestamp if status is set to 'completed'
             for key, value in update_data.items():
@@ -366,7 +389,16 @@ class RunManager:
             final_metadata = run.metadata_
             pydantic_run = run.to_pydantic()
 
-            await session.commit()
+            # context manager now handles commits
+            # await session.commit()
+
+        # Release conversation lock if conversation_id was provided
+        if is_terminal_update and conversation_id:
+            try:
+                redis_client = await get_redis_client()
+                await redis_client.release_conversation_lock(conversation_id)
+            except Exception as lock_error:
+                logger.warning(f"Failed to release conversation lock for conversation {conversation_id}: {lock_error}")
 
         # Update agent's last_stop_reason when run completes
         # Do this after run update is committed to database
@@ -417,14 +449,17 @@ class RunManager:
             metrics.num_steps = num_steps
             metrics.tools_used = list(tools_used) if tools_used else None
             await metrics.update_async(db_session=session, actor=actor, no_commit=True, no_refresh=True)
-            await session.commit()
+            # context manager now handles commits
+            # await session.commit()
 
         # Dispatch callback outside of database session if needed
         if needs_callback:
             if refresh_result_messages:
+                # Defensive: ensure stop_reason is never None
+                stop_reason_value = pydantic_run.stop_reason if pydantic_run.stop_reason else StopReasonType.completed
                 result = LettaResponse(
                     messages=await self.get_run_messages(run_id=run_id, actor=actor),
-                    stop_reason=LettaStopReason(stop_reason=pydantic_run.stop_reason),
+                    stop_reason=LettaStopReason(stop_reason=stop_reason_value),
                     usage=await self.get_run_usage(run_id=run_id, actor=actor),
                 )
                 final_metadata["result"] = result.model_dump()
@@ -445,7 +480,8 @@ class RunManager:
                 run.callback_error = callback_result.get("callback_error")
                 pydantic_run = run.to_pydantic()
                 await run.update_async(db_session=session, actor=actor, no_commit=True, no_refresh=True)
-                await session.commit()
+                # context manager now handles commits
+                # await session.commit()
 
         return pydantic_run
 
@@ -609,12 +645,11 @@ class RunManager:
 
         logger.debug(f"Cancelling run {run_id} for agent {agent_id}")
 
-        # check if run can be cancelled (cannot cancel a completed, failed, or cancelled run)
+        # Cancellation should be idempotent: if a run is already terminated, treat this as a no-op.
+        # This commonly happens when a run finishes between client request and server handling.
         if run.stop_reason and run.stop_reason not in [StopReasonType.requires_approval]:
-            logger.error(f"Run {run_id} cannot be cancelled because it is already terminated with stop reason: {run.stop_reason.value}")
-            raise LettaInvalidArgumentError(
-                f"Run {run_id} cannot be cancelled because it is already terminated with stop reason: {run.stop_reason.value}"
-            )
+            logger.debug(f"Run {run_id} cannot be cancelled because it is already terminated with stop reason: {run.stop_reason.value}")
+            return
 
         # Check if agent is waiting for approval by examining the last message
         agent_state = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
@@ -624,7 +659,10 @@ class RunManager:
         # cancel the run
         # NOTE: this should update the agent's last stop reason to cancelled
         run = await self.update_run_by_id_async(
-            run_id=run_id, update=RunUpdate(status=RunStatus.cancelled, stop_reason=StopReasonType.cancelled), actor=actor
+            run_id=run_id,
+            update=RunUpdate(status=RunStatus.cancelled, stop_reason=StopReasonType.cancelled),
+            actor=actor,
+            conversation_id=run.conversation_id,
         )
 
         # cleanup the agent's state
@@ -633,8 +671,26 @@ class RunManager:
             logger.debug(f"Agent was waiting for approval, adding denial messages for run {run_id}")
             approval_request_message = current_in_context_messages[-1]
 
-            # Ensure the approval request has tool calls to deny
+            # Find ALL pending tool calls (both requiring approval and not requiring approval)
+            # The assistant message may have tool calls that didn't require approval
+            all_pending_tool_calls = []
             if approval_request_message.tool_calls:
+                all_pending_tool_calls.extend(approval_request_message.tool_calls)
+
+            # Check if there's an assistant message before the approval request with additional tool calls
+            if len(current_in_context_messages) >= 2:
+                potential_assistant_msg = current_in_context_messages[-2]
+                if potential_assistant_msg.role == MessageRole.assistant and potential_assistant_msg.tool_calls:
+                    # Add any tool calls from the assistant message that aren't already in the approval request
+                    approval_tool_call_ids = (
+                        {tc.id for tc in approval_request_message.tool_calls} if approval_request_message.tool_calls else set()
+                    )
+                    for tool_call in potential_assistant_msg.tool_calls:
+                        if tool_call.id not in approval_tool_call_ids:
+                            all_pending_tool_calls.append(tool_call)
+
+            # Ensure we have tool calls to deny
+            if all_pending_tool_calls:
                 from letta.constants import TOOL_CALL_DENIAL_ON_CANCEL
                 from letta.schemas.letta_message import ApprovalReturn
                 from letta.schemas.message import ApprovalCreate
@@ -644,15 +700,19 @@ class RunManager:
                     create_tool_returns_for_denials,
                 )
 
-                # Create denials for ALL pending tool calls
-                denials = [
-                    ApprovalReturn(
-                        tool_call_id=tool_call.id,
-                        approve=False,
-                        reason=TOOL_CALL_DENIAL_ON_CANCEL,
-                    )
-                    for tool_call in approval_request_message.tool_calls
-                ]
+                # Create denials for ALL pending tool calls (including those that didn't require approval)
+                denials = (
+                    [
+                        ApprovalReturn(
+                            tool_call_id=tool_call.id,
+                            approve=False,
+                            reason=TOOL_CALL_DENIAL_ON_CANCEL,
+                        )
+                        for tool_call in approval_request_message.tool_calls
+                    ]
+                    if approval_request_message.tool_calls
+                    else []
+                )
 
                 # Create an ApprovalCreate input with the denials
                 approval_input = ApprovalCreate(
@@ -661,16 +721,16 @@ class RunManager:
                 )
 
                 # Use the standard function to create properly formatted approval response messages
-                approval_response_messages = create_approval_response_message_from_input(
+                approval_response_messages = await create_approval_response_message_from_input(
                     agent_state=agent_state,
                     input_message=approval_input,
                     run_id=run_id,
                 )
 
                 # Create tool returns for ALL denied tool calls using shared helper
-                # This handles all pending tool calls at once since they all have the same denial reason
+                # This includes both tool calls requiring approval AND those that didn't
                 tool_returns = create_tool_returns_for_denials(
-                    tool_calls=approval_request_message.tool_calls,  # ALL pending tool calls
+                    tool_calls=all_pending_tool_calls,
                     denial_reason=TOOL_CALL_DENIAL_ON_CANCEL,
                     timezone=agent_state.timezone,
                 )

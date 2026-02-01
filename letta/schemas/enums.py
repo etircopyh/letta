@@ -26,6 +26,7 @@ class PrimitiveType(str, Enum):
     SANDBOX_CONFIG = "sandbox"  # Note: sandbox_config IDs use "sandbox" prefix
     STEP = "step"
     IDENTITY = "identity"
+    CONVERSATION = "conv"
 
     # Infrastructure types
     MCP_SERVER = "mcp_server"
@@ -54,6 +55,7 @@ class ProviderType(str, Enum):
     azure = "azure"
     bedrock = "bedrock"
     cerebras = "cerebras"
+    chatgpt_oauth = "chatgpt_oauth"
     deepseek = "deepseek"
     google_ai = "google_ai"
     google_vertex = "google_vertex"
@@ -61,12 +63,16 @@ class ProviderType(str, Enum):
     hugging_face = "hugging-face"
     letta = "letta"
     lmstudio_openai = "lmstudio_openai"
+    minimax = "minimax"
     mistral = "mistral"
     ollama = "ollama"
     openai = "openai"
     together = "together"
     vllm = "vllm"
+    sglang = "sglang"
+    openrouter = "openrouter"
     xai = "xai"
+    zai = "zai"
 
 
 class AgentType(str, Enum):

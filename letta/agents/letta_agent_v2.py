@@ -34,6 +34,7 @@ from letta.schemas.agent import AgentState, UpdateAgent
 from letta.schemas.enums import AgentType, MessageStreamStatus, RunStatus, StepStatus
 from letta.schemas.letta_message import LettaMessage, MessageType
 from letta.schemas.letta_message_content import OmittedReasoningContent, ReasoningContent, RedactedReasoningContent, TextContent
+from letta.schemas.letta_request import ClientToolSchema
 from letta.schemas.letta_response import LettaResponse
 from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
 from letta.schemas.message import Message, MessageCreate, MessageUpdate
@@ -154,7 +155,13 @@ class LettaAgentV2(BaseAgentV2):
         response = self._step(
             run_id=None,
             messages=in_context_messages + input_messages_to_persist,
-            llm_adapter=LettaLLMRequestAdapter(llm_client=self.llm_client, llm_config=self.agent_state.llm_config),
+            llm_adapter=LettaLLMRequestAdapter(
+                llm_client=self.llm_client,
+                llm_config=self.agent_state.llm_config,
+                agent_tags=self.agent_state.tags,
+                org_id=self.actor.organization_id,
+                user_id=self.actor.id,
+            ),
             dry_run=True,
             enforce_run_id_set=False,
         )
@@ -173,6 +180,7 @@ class LettaAgentV2(BaseAgentV2):
         use_assistant_message: bool = True,
         include_return_message_types: list[MessageType] | None = None,
         request_start_timestamp_ns: int | None = None,
+        client_tools: list[ClientToolSchema] | None = None,
     ) -> LettaResponse:
         """
         Execute the agent loop in blocking mode, returning all messages at once.
@@ -184,6 +192,7 @@ class LettaAgentV2(BaseAgentV2):
             use_assistant_message: Whether to use assistant message format
             include_return_message_types: Filter for which message types to return
             request_start_timestamp_ns: Start time for tracking request duration
+            client_tools: Optional list of client-side tools (not used in V2, for API compatibility)
 
         Returns:
             LettaResponse: Complete response with all messages and metadata
@@ -202,7 +211,15 @@ class LettaAgentV2(BaseAgentV2):
             response = self._step(
                 messages=in_context_messages + self.response_messages,
                 input_messages_to_persist=input_messages_to_persist,
-                llm_adapter=LettaLLMRequestAdapter(llm_client=self.llm_client, llm_config=self.agent_state.llm_config),
+                llm_adapter=LettaLLMRequestAdapter(
+                    llm_client=self.llm_client,
+                    llm_config=self.agent_state.llm_config,
+                    agent_id=self.agent_state.id,
+                    agent_tags=self.agent_state.tags,
+                    run_id=run_id,
+                    org_id=self.actor.organization_id,
+                    user_id=self.actor.id,
+                ),
                 run_id=run_id,
                 use_assistant_message=use_assistant_message,
                 include_return_message_types=include_return_message_types,
@@ -225,6 +242,7 @@ class LettaAgentV2(BaseAgentV2):
                 new_letta_messages=self.response_messages,
                 total_tokens=self.usage.total_tokens,
                 force=False,
+                run_id=run_id,
             )
 
         if self.stop_reason is None:
@@ -251,6 +269,8 @@ class LettaAgentV2(BaseAgentV2):
         use_assistant_message: bool = True,
         include_return_message_types: list[MessageType] | None = None,
         request_start_timestamp_ns: int | None = None,
+        conversation_id: str | None = None,  # Not used in V2, but accepted for API compatibility
+        client_tools: list[ClientToolSchema] | None = None,
     ) -> AsyncGenerator[str, None]:
         """
         Execute the agent loop in streaming mode, yielding chunks as they become available.
@@ -268,6 +288,7 @@ class LettaAgentV2(BaseAgentV2):
             use_assistant_message: Whether to use assistant message format
             include_return_message_types: Filter for which message types to return
             request_start_timestamp_ns: Start time for tracking request duration
+            client_tools: Optional list of client-side tools (not used in V2, for API compatibility)
 
         Yields:
             str: JSON-formatted SSE data chunks for each completed step
@@ -280,12 +301,21 @@ class LettaAgentV2(BaseAgentV2):
             llm_adapter = LettaLLMStreamAdapter(
                 llm_client=self.llm_client,
                 llm_config=self.agent_state.llm_config,
+                agent_id=self.agent_state.id,
+                agent_tags=self.agent_state.tags,
                 run_id=run_id,
+                org_id=self.actor.organization_id,
+                user_id=self.actor.id,
             )
         else:
             llm_adapter = LettaLLMRequestAdapter(
                 llm_client=self.llm_client,
                 llm_config=self.agent_state.llm_config,
+                agent_id=self.agent_state.id,
+                agent_tags=self.agent_state.tags,
+                run_id=run_id,
+                org_id=self.actor.organization_id,
+                user_id=self.actor.id,
             )
 
         try:
@@ -324,6 +354,7 @@ class LettaAgentV2(BaseAgentV2):
                     new_letta_messages=self.response_messages,
                     total_tokens=self.usage.total_tokens,
                     force=False,
+                    run_id=run_id,
                 )
 
         except:
@@ -469,6 +500,8 @@ class LettaAgentV2(BaseAgentV2):
                                 in_context_messages=messages,
                                 new_letta_messages=self.response_messages,
                                 force=True,
+                                run_id=run_id,
+                                step_id=step_id,
                             )
                         else:
                             raise e
@@ -773,7 +806,9 @@ class LettaAgentV2(BaseAgentV2):
             last_function_response=self.last_function_response,
             error_on_empty=False,  # Return empty list instead of raising error
         ) or list(set(t.name for t in tools))
-        allowed_tools = [enable_strict_mode(t.json_schema) for t in tools if t.name in set(valid_tool_names)]
+        allowed_tools = [
+            enable_strict_mode(t.json_schema, strict=self.agent_state.llm_config.strict) for t in tools if t.name in set(valid_tool_names)
+        ]
         terminal_tool_names = {rule.tool_name for rule in self.tool_rules_solver.terminal_tool_rules}
         allowed_tools = runtime_override_tool_json_schema(
             tool_list=allowed_tools,
@@ -1168,15 +1203,14 @@ class LettaAgentV2(BaseAgentV2):
         """
         from letta.schemas.tool_execution_result import ToolExecutionResult
 
-        tool_name = target_tool.name
-
-        # Special memory case
+        # Check for None before accessing attributes
         if not target_tool:
-            # TODO: fix this error message
             return ToolExecutionResult(
-                func_return=f"Tool {tool_name} not found",
+                func_return="Tool not found",
                 status="error",
             )
+
+        tool_name = target_tool.name
 
         # TODO: This temp. Move this logic and code to executors
 
@@ -1226,6 +1260,8 @@ class LettaAgentV2(BaseAgentV2):
         new_letta_messages: list[Message],
         total_tokens: int | None = None,
         force: bool = False,
+        run_id: str | None = None,
+        step_id: str | None = None,
     ) -> list[Message]:
         self.logger.warning("Running deprecated v2 summarizer. This should be removed in the future.")
         # always skip summarization if last message is an approval request message
@@ -1248,6 +1284,8 @@ class LettaAgentV2(BaseAgentV2):
                         new_letta_messages=new_letta_messages,
                         force=True,
                         clear=True,
+                        run_id=run_id,
+                        step_id=step_id,
                     )
                 else:
                     # NOTE (Sarah): Seems like this is doing nothing?
@@ -1257,6 +1295,8 @@ class LettaAgentV2(BaseAgentV2):
                     new_in_context_messages, updated = await self.summarizer.summarize(
                         in_context_messages=in_context_messages,
                         new_letta_messages=new_letta_messages,
+                        run_id=run_id,
+                        step_id=step_id,
                     )
             except Exception as e:
                 self.logger.error(f"Failed to summarize conversation history: {e}")

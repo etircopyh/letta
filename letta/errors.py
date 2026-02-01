@@ -53,6 +53,44 @@ class PendingApprovalError(LettaError):
         super().__init__(message=message, code=code, details=details)
 
 
+class NoActiveRunsToCancelError(LettaError):
+    """Error raised when attempting to cancel but there are no active runs to cancel."""
+
+    def __init__(self, agent_id: Optional[str] = None, conversation_id: Optional[str] = None):
+        message = "No active runs to cancel"
+        if agent_id:
+            message = f"No active runs to cancel for agent {agent_id}"
+        if conversation_id:
+            message = f"No active runs to cancel for conversation {conversation_id}"
+        details = {"error_code": "NO_ACTIVE_RUNS_TO_CANCEL", "agent_id": agent_id, "conversation_id": conversation_id}
+        super().__init__(message=message, code=ErrorCode.CONFLICT, details=details)
+
+
+class ConcurrentUpdateError(LettaError):
+    """Error raised when a resource was updated by another transaction (optimistic locking conflict)."""
+
+    def __init__(self, resource_type: str, resource_id: str):
+        message = f"{resource_type} with id '{resource_id}' was updated by another transaction. Please retry your request."
+        details = {"error_code": "CONCURRENT_UPDATE", "resource_type": resource_type, "resource_id": resource_id}
+        super().__init__(message=message, code=ErrorCode.CONFLICT, details=details)
+
+
+class ConversationBusyError(LettaError):
+    """Error raised when attempting to send a message while another request is already processing for the same conversation."""
+
+    def __init__(self, conversation_id: str, lock_holder_token: Optional[str] = None):
+        self.conversation_id = conversation_id
+        self.lock_holder_token = lock_holder_token
+        message = "Cannot send a new message: Another request is currently being processed for this conversation. Please wait for the current request to complete."
+        code = ErrorCode.CONFLICT
+        details = {
+            "error_code": "CONVERSATION_BUSY",
+            "conversation_id": conversation_id,
+            "lock_holder_token": lock_holder_token,
+        }
+        super().__init__(message=message, code=code, details=details)
+
+
 class LettaToolCreateError(LettaError):
     """Error raised when a tool cannot be created."""
 
@@ -90,6 +128,19 @@ class LettaConfigurationError(LettaError):
         super().__init__(message=message, details={"missing_fields": self.missing_fields})
 
 
+class EmbeddingConfigRequiredError(LettaError):
+    """Error raised when an operation requires embedding_config but the agent doesn't have one configured."""
+
+    def __init__(self, agent_id: Optional[str] = None, operation: Optional[str] = None):
+        self.agent_id = agent_id
+        self.operation = operation
+        message = "This operation requires an embedding configuration, but the agent does not have one configured."
+        if operation:
+            message = f"Operation '{operation}' requires an embedding configuration, but the agent does not have one configured."
+        details = {"agent_id": agent_id, "operation": operation}
+        super().__init__(message=message, code=ErrorCode.INVALID_ARGUMENT, details=details)
+
+
 class LettaAgentNotFoundError(LettaError):
     """Error raised when an agent is not found."""
 
@@ -116,9 +167,7 @@ class LettaImageFetchError(LettaError):
     def __init__(self, url: str, reason: str):
         details = {"url": url, "reason": reason}
         super().__init__(
-            message=f"Failed to fetch image from {url}: {reason}",
-            code=ErrorCode.INVALID_ARGUMENT,
-            details=details,
+            message=f"Failed to fetch image from {url}: {reason}", code=ErrorCode.INVALID_ARGUMENT, details=details,
         )
 
 
@@ -259,9 +308,7 @@ class ContextWindowExceededError(LettaError):
     def __init__(self, message: str, details: dict = {}):
         error_message = f"{message} ({details})"
         super().__init__(
-            message=error_message,
-            code=ErrorCode.CONTEXT_WINDOW_EXCEEDED,
-            details=details,
+            message=error_message, code=ErrorCode.CONTEXT_WINDOW_EXCEEDED, details=details,
         )
 
 
@@ -281,9 +328,7 @@ class RateLimitExceededError(LettaError):
     def __init__(self, message: str, max_retries: int):
         error_message = f"{message} ({max_retries})"
         super().__init__(
-            message=error_message,
-            code=ErrorCode.RATE_LIMIT_EXCEEDED,
-            details={"max_retries": max_retries},
+            message=error_message, code=ErrorCode.RATE_LIMIT_EXCEEDED, details={"max_retries": max_retries},
         )
 
 
@@ -338,8 +383,7 @@ class HandleNotFoundError(LettaError):
 
     def __init__(self, handle: str, available_handles: List[str]):
         super().__init__(
-            message=f"Handle {handle} not found, must be one of {available_handles}",
-            code=ErrorCode.NOT_FOUND,
+            message=f"Handle {handle} not found, must be one of {available_handles}", code=ErrorCode.NOT_FOUND,
         )
 
 

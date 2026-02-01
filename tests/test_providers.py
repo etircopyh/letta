@@ -11,10 +11,13 @@ from letta.schemas.providers import (
     GoogleAIProvider,
     GoogleVertexProvider,
     GroqProvider,
+    MiniMaxProvider,
     OllamaProvider,
     OpenAIProvider,
+    SGLangProvider,
     TogetherProvider,
     VLLMProvider,
+    ZAIProvider,
 )
 from letta.schemas.secret import Secret
 from letta.settings import model_settings
@@ -104,6 +107,19 @@ async def test_deepseek():
     assert models[0].handle == f"{provider.name}/{models[0].model}"
 
 
+@pytest.mark.skipif(model_settings.zai_api_key is None, reason="Only run if ZAI_API_KEY is set.")
+@pytest.mark.asyncio
+async def test_zai():
+    provider = ZAIProvider(
+        name="zai",
+        api_key_enc=Secret.from_plaintext(model_settings.zai_api_key),
+        base_url=model_settings.zai_base_url,
+    )
+    models = await provider.list_llm_models_async()
+    assert len(models) > 0
+    assert models[0].handle == f"{provider.name}/{models[0].model}"
+
+
 @pytest.mark.skipif(model_settings.groq_api_key is None, reason="Only run if GROQ_API_KEY is set.")
 @pytest.mark.asyncio
 async def test_groq():
@@ -114,6 +130,32 @@ async def test_groq():
     models = await provider.list_llm_models_async()
     assert len(models) > 0
     assert models[0].handle == f"{provider.name}/{models[0].model}"
+
+
+@pytest.mark.asyncio
+async def test_minimax():
+    """Test MiniMax provider - uses hardcoded model list, no API key required."""
+    provider = MiniMaxProvider(name="minimax")
+    models = await provider.list_llm_models_async()
+
+    # Should have exactly 3 models: M2.1, M2.1-lightning, M2
+    assert len(models) == 3
+
+    # Verify model properties
+    model_names = {m.model for m in models}
+    assert "MiniMax-M2.1" in model_names
+    assert "MiniMax-M2.1-lightning" in model_names
+    assert "MiniMax-M2" in model_names
+
+    # Verify handle format
+    for model in models:
+        assert model.handle == f"{provider.name}/{model.model}"
+        # All MiniMax models have 200K context window
+        assert model.context_window == 200000
+        # All MiniMax models have 128K max output
+        assert model.max_tokens == 128000
+        # MiniMax uses Anthropic-compatible API endpoint
+        assert model.model_endpoint_type == "minimax"
 
 
 @pytest.mark.skipif(model_settings.azure_api_key is None, reason="Only run if AZURE_API_KEY is set.")
@@ -183,6 +225,18 @@ async def test_vllm():
 
     embedding_models = await provider.list_embedding_models_async()
     assert len(embedding_models) == 0  # embedding models currently not supported by vLLM
+
+
+@pytest.mark.skipif(model_settings.sglang_api_base is None, reason="Only run if SGLANG_API_BASE is set.")
+@pytest.mark.asyncio
+async def test_sglang():
+    provider = SGLangProvider(name="sglang", base_url=model_settings.sglang_api_base)
+    models = await provider.list_llm_models_async()
+    assert len(models) > 0
+    assert models[0].handle == f"{provider.name}/{models[0].model}"
+
+    embedding_models = await provider.list_embedding_models_async()
+    assert len(embedding_models) == 0  # embedding models currently not supported by SGLang
 
 
 # TODO: Add back in, difficulty adding this to CI properly, need boto credentials
